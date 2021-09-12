@@ -1,69 +1,32 @@
-package main
+package kubesecretpipe
 
 import (
 	"context"
-	"flag"
 	"fmt"
-	"io/ioutil"
-	"log"
 	"sync"
 
-	"gopkg.in/yaml.v2"
-	"gopkg.zouai.io/colossus/clog"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
-func main() {
-	ctx := context.Background()
-	configFile := flag.String("config-file", "", "The config file")
-	flag.Parse()
-	configData, err := ioutil.ReadFile(*configFile)
-	if err != nil {
-		clog.Errf(ctx, err, "Error reading config file")
-		panic("")
-	}
-
-	baseConfig := &Config{}
-	err = yaml.Unmarshal(configData, &baseConfig)
-	if err != nil {
-		log.Fatalf("error: %v", err)
-	}
-
-	// kubeConfig, err := clientcmd.BuildConfigFromFlags("", "/tmp/kubeconfig")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	client, err := rest.InClusterConfig()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(client)
-	if err != nil {
-		panic(err)
-	}
-	for _, c := range baseConfig.Targets {
+func Spawn(ctx context.Context, wg *sync.WaitGroup, clientset *kubernetes.Clientset, config *Config) error {
+	for _, c := range config.Targets {
 		compiler := &Compiler{
 			Clientset: clientset,
 			Config:    c,
+			wg:        wg,
 		}
-		err = compiler.Start(context.Background())
+		err := compiler.Start(ctx)
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("error starting compiler for '%s/%s': %w", c.TargetNamespace, c.TargetName, err)
 		}
 	}
-	CoreWG.Wait()
-
+	return nil
 }
 
-var CoreWG sync.WaitGroup
-
-func watchSecret(ctx context.Context, clientset *kubernetes.Clientset, namespace string, secret string, resultChan chan<- *v1.Secret) error {
+func watchSecret(ctx context.Context, wg *sync.WaitGroup, clientset *kubernetes.Clientset, namespace string, secret string, resultChan chan<- *v1.Secret) error {
 	watcher, err := clientset.CoreV1().Secrets(namespace).Watch(ctx, metav1.SingleObject(metav1.ObjectMeta{
 		Name:      secret,
 		Namespace: namespace,
@@ -71,9 +34,9 @@ func watchSecret(ctx context.Context, clientset *kubernetes.Clientset, namespace
 	if err != nil {
 		return fmt.Errorf("error watching secret: %w", err)
 	}
-	CoreWG.Add(1)
+	wg.Add(1)
 	go func() {
-		defer CoreWG.Done()
+		defer wg.Done()
 		for {
 			select {
 			case <-ctx.Done():
@@ -92,7 +55,7 @@ func watchSecret(ctx context.Context, clientset *kubernetes.Clientset, namespace
 	return nil
 }
 
-func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset, namespace string, configmap string) (<-chan *v1.ConfigMap, error) {
+func watchConfigMap(ctx context.Context, wg *sync.WaitGroup, clientset *kubernetes.Clientset, namespace string, configmap string) (<-chan *v1.ConfigMap, error) {
 	watcher, err := clientset.CoreV1().ConfigMaps(namespace).Watch(ctx, metav1.SingleObject(metav1.ObjectMeta{
 		Name: configmap,
 	}))
@@ -100,9 +63,9 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset, namesp
 		return nil, fmt.Errorf("error watching secret: %w", err)
 	}
 	resultChan := make(chan *v1.ConfigMap)
-	CoreWG.Add(1)
+	wg.Add(1)
 	go func() {
-		defer CoreWG.Done()
+		defer wg.Done()
 		for {
 			select {
 			case <-ctx.Done():

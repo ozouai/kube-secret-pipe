@@ -1,4 +1,4 @@
-package main
+package kubesecretpipe
 
 import (
 	"bytes"
@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"html/template"
+	"sync"
 
 	"gopkg.zouai.io/colossus/clog"
 	corev1 "k8s.io/api/core/v1"
@@ -19,28 +20,34 @@ type Compiler struct {
 	inputConfigMap *corev1.ConfigMap
 	inputSecrets   map[string]*corev1.Secret
 	outputHash     []byte
+	wg             *sync.WaitGroup
+	logger         clog.LoggerInterface
 }
 
 func (m *Compiler) Start(ctx context.Context) error {
-	clog.Infof(ctx, "Starting Compiler for '%s/%s'", m.Config.TargetNamespace, m.Config.TargetName)
+	m.logger = clog.SubLoggerWithPrefix(ctx, "SecretCompiler").SubLoggerWithFields(ctx, map[string]interface{}{
+		"target": m.Config.TargetName + "/" + m.Config.TargetNamespace,
+		"source": m.Config.BaseConfigMap.Namespace + "/" + m.Config.BaseConfigMap.Name,
+	})
+	m.logger.Infof(ctx, "Starting Secret Compiler")
 	m.inputSecrets = map[string]*corev1.Secret{}
 	existingSecret, err := m.Clientset.CoreV1().Secrets(m.Config.TargetNamespace).Get(ctx, m.Config.TargetName, metav1.GetOptions{})
 	if err != nil {
-		clog.Err(ctx, err, "Got an error attempting to get the output secret")
+		m.logger.Err(ctx, err, "Got an error attempting to get the output secret, assuming doesn't exist")
 		existingSecret = nil
 	}
 	m.outputHash = secretToHash(existingSecret)
 
 	inputConfigMap, err := m.Clientset.CoreV1().ConfigMaps(m.Config.TargetNamespace).Get(ctx, m.Config.TargetName, metav1.GetOptions{})
 	if err != nil {
-		clog.Errf(ctx, err, "Got an error getting the input configmap")
+		m.logger.Errf(ctx, err, "Got an error getting the input configmap")
 		return fmt.Errorf("error getting input configmap: %w", err)
 	}
 	m.inputConfigMap = inputConfigMap
 	for _, secretConfig := range m.Config.Secrets {
 		secret, err := m.Clientset.CoreV1().Secrets(secretConfig.Namespace).Get(ctx, secretConfig.Name, metav1.GetOptions{})
 		if err != nil {
-			clog.Errf(ctx, err, "Got an error getting one of the input secrets '%s/%s'", secretConfig.Namespace, secretConfig.Name)
+			m.logger.Errf(ctx, err, "Got an error getting one of the input secrets '%s/%s'", secretConfig.Namespace, secretConfig.Name)
 			return fmt.Errorf("error getting secretConfig: %w", err)
 		}
 		m.inputSecrets[secretConfig.Namespace+"/"+secretConfig.Name] = secret
@@ -48,39 +55,39 @@ func (m *Compiler) Start(ctx context.Context) error {
 
 	firstOutput, err := m.compileFromCache(ctx)
 	if err != nil {
-		clog.Errf(ctx, err, "Error compiling first version")
+		m.logger.Errf(ctx, err, "Error compiling first version")
 		return fmt.Errorf("error compiling configmap: %w", err)
 	}
 	firstHash := secretToHash(firstOutput)
 	if existingSecret == nil {
-		clog.Info(ctx, "Uploading new version")
+		m.logger.Info(ctx, "Uploading first version of the compiled secret")
 		_, err = m.Clientset.CoreV1().Secrets(m.Config.TargetNamespace).Create(ctx, firstOutput, metav1.CreateOptions{})
 		if err != nil {
 			clog.Errf(ctx, err, "Error uploading new version")
 		}
-	} else if bytes.Compare(firstHash, m.outputHash) != 0 {
-		clog.Info(ctx, "Uploading new version")
+	} else if !bytes.Equal(firstHash, m.outputHash) {
+		m.logger.Info(ctx, "Launch calculated new version of the compiled secret, uploading")
 		_, err = m.Clientset.CoreV1().Secrets(m.Config.TargetNamespace).Update(ctx, firstOutput, metav1.UpdateOptions{})
 		if err != nil {
-			clog.Errf(ctx, err, "Error uploading new version")
+			m.logger.Errf(ctx, err, "Error uploading new version")
 		}
 	}
-	inputConfigUpdate, err := watchConfigMap(ctx, m.Clientset, m.inputConfigMap.Namespace, m.inputConfigMap.Name)
+	inputConfigUpdate, err := watchConfigMap(ctx, m.wg, m.Clientset, m.inputConfigMap.Namespace, m.inputConfigMap.Name)
 	if err != nil {
-		clog.Errf(ctx, err, "Error watching configmap for updates")
+		m.logger.Errf(ctx, err, "Error watching configmap for updates")
 		return fmt.Errorf("error watching configmap for updates: %w", err)
 	}
 	secretUpdateChannel := make(chan *corev1.Secret)
 	for _, secretConfig := range m.inputSecrets {
-		err := watchSecret(ctx, m.Clientset, secretConfig.Namespace, secretConfig.Name, secretUpdateChannel)
+		err := watchSecret(ctx, m.wg, m.Clientset, secretConfig.Namespace, secretConfig.Name, secretUpdateChannel)
 		if err != nil {
-			clog.Errf(ctx, err, "Error watching secret for updates")
+			m.logger.Errf(ctx, err, "Error watching secret for updates")
 			return fmt.Errorf("error watching secret for updates: %w", err)
 		}
 	}
-	CoreWG.Add(1)
+	m.wg.Add(1)
 	go func() {
-		defer CoreWG.Done()
+		defer m.wg.Done()
 		for {
 			select {
 			case cf := <-inputConfigUpdate:
@@ -98,15 +105,15 @@ func (m *Compiler) Start(ctx context.Context) error {
 func (m *Compiler) update(ctx context.Context) error {
 	output, err := m.compileFromCache(ctx)
 	if err != nil {
-		clog.Errf(ctx, err, "Error compiling first version")
+		m.logger.Errf(ctx, err, "Error compiling first version")
 		return fmt.Errorf("error compiling configmap: %w", err)
 	}
 	outputHash := secretToHash(output)
-	if bytes.Compare(outputHash, m.outputHash) != 0 {
-		clog.Info(ctx, "Uploading new version")
+	if !bytes.Equal(outputHash, m.outputHash) {
+		m.logger.Info(ctx, "Uploading new version")
 		_, err = m.Clientset.CoreV1().Secrets(m.Config.TargetNamespace).Update(ctx, output, metav1.UpdateOptions{})
 		if err != nil {
-			clog.Errf(ctx, err, "Error uploading new version")
+			m.logger.Errf(ctx, err, "Error uploading new version")
 		}
 	}
 	return nil
@@ -124,13 +131,13 @@ func (m *Compiler) compileFromCache(ctx context.Context) (*corev1.Secret, error)
 	for k, v := range m.inputConfigMap.Data {
 		tmpl, err := template.New(m.Config.TargetName).Parse(v)
 		if err != nil {
-			clog.Errf(ctx, err, "Error parsing key '%s' of input configmap '%s/%s' for template", k, m.inputConfigMap.Name, m.inputConfigMap.Namespace)
+			m.logger.Errf(ctx, err, "Error parsing key '%s' of input configmap '%s/%s' for template", k, m.inputConfigMap.Name, m.inputConfigMap.Namespace)
 			continue
 		}
 		buf := bytes.NewBufferString("")
 		err = tmpl.Execute(buf, templateData)
 		if err != nil {
-			clog.Errf(ctx, err, "Error executing template for key '%s' of input configmap '%s/%s'", k, m.inputConfigMap.Name, m.inputConfigMap.Namespace)
+			m.logger.Errf(ctx, err, "Error executing template for key '%s' of input configmap '%s/%s'", k, m.inputConfigMap.Name, m.inputConfigMap.Namespace)
 			continue
 		}
 

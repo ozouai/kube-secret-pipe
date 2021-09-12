@@ -1,7 +1,8 @@
 FROM golang:1.17.1-alpine as builder
 WORKDIR /tmp/build
 COPY . . 
-RUN go build -o /server .
+WORKDIR /tmp/build/cmd
+RUN go build -o /kube-secret-pipe .
 FROM alpine
-COPY --from=builder /server /server
-CMD ["/server"]
+COPY --from=builder /kube-secret-pipe /kube-secret-pipe
+ENTRYPOINT ["/server"]
