@@ -5,4 +5,4 @@ WORKDIR /tmp/build/cmd
 RUN go build -o /kube-secret-pipe .
 FROM alpine
 COPY --from=builder /kube-secret-pipe /kube-secret-pipe
-ENTRYPOINT ["/server"]
+ENTRYPOINT ["/kube-secret-pipe"]
